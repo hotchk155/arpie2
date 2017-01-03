@@ -3,6 +3,7 @@
 //
 #include <system.h>
 #include <memory.h>
+#include "a2-display.h"
 
 // 
 // PIC12F1822 CONFIG BYTES
@@ -41,15 +42,41 @@ typedef unsigned char byte;
 // definitions for the transmit buffer, used to return
 // keypresses to the master
 #define TX_BUFFER_MASK	0x0F
-byte tx_buffer[16];
-byte tx_head = 0;
-byte tx_tail = 0;
+volatile byte tx_buffer[16];
+volatile byte tx_head = 0;
+volatile byte tx_tail = 0;
 
-// receive buffer for display data from the master
-#define RX_BUFFER_MASK	0x3F
-byte rx_buffer[64];
-byte rx_head = 0;
-byte rx_tail = 0;
+// definitions for the receive buffer, which is used
+// to queue up incoming commands from the master 
+#define NUM_CMDS		4
+#define MAX_CMD_DATA	24
+
+// structure to hold a command from the master
+typedef struct {
+	byte data[MAX_CMD_DATA];
+	byte data_len;
+} MASTER_CMD;
+
+// define a circular buffer of commands (we need to 
+// do the wierd indirection thing to stop data exceeding
+// PIC pagesize...)
+volatile MASTER_CMD _cmd0;
+volatile MASTER_CMD _cmd1;
+volatile MASTER_CMD _cmd2;
+volatile MASTER_CMD _cmd3;
+volatile MASTER_CMD *cmd_buffer[NUM_CMDS] = {
+	&_cmd0, 
+	&_cmd1, 
+	&_cmd2, 
+	&_cmd3
+};
+volatile byte cmd_head = 0;
+volatile byte cmd_tail = 0;
+
+// This pointer is set when a command is being
+// populated by the I2C slave code
+volatile MASTER_CMD *write_cmd = 0;
+
 
 
 /////////////////////////////////////////////////////////////////////////
@@ -299,7 +326,21 @@ void interrupt( void )
 	{       
 		byte d;
 		pir1.3 = 0; // clear interrupt flag
-		if(!ssp1stat.D_NOT_A) // master has sent our slave address
+		
+		if(ssp1stat.4) // stop bit received last
+		{
+			// were we assembling a command?
+			if(write_cmd) 
+			{
+				// advance the buffer head, making the current
+				// command available to be processed by the main
+				// application thread
+				if(++cmd_head >= NUM_CMDS)
+					cmd_head = 0;
+				write_cmd = 0;
+			}
+		}
+		else if(!ssp1stat.D_NOT_A) // master has sent our slave address
 		{                
 			d = ssp1buf; // read and discard address to clear BF flag
 			
@@ -325,13 +366,15 @@ void interrupt( void )
 		{ 
 			if(!ssp1stat.R_NOT_W) // MASTER IS WRITING TO SLAVE
 			{
-				d = ssp1buf;
-				byte next_head = (rx_head + 1)&RX_BUFFER_MASK;
-				if(next_head != rx_tail) 
+				// is there any command currently being processed?
+				if(!write_cmd) 
 				{
-					rx_buffer[rx_head] = d;
-					rx_head = next_head;
+					// no, so take the next one
+					write_cmd = cmd_buffer[cmd_head];
+					write_cmd->data_len = 0;
 				}
+				// add the received byte into the command data buffer
+				write_cmd->data[write_cmd->data_len++] = ssp1buf;				
 			}
 			else // MASTER IS READING FROM SLAVE
 			{                                               
@@ -371,6 +414,8 @@ void i2c_init(byte addr)
         ssp1con1.2 = 1; // } I2C slave mode
         ssp1con1.1 = 1; // } with 7 bit address
         ssp1con1.0 = 0; // }
+        
+        ssp1con3.6 = 1; // enable interrupt on stop condition
         
         ssp1msk = 0b01111111;   // address mask bits 0-6
         ssp1add = addr<<1;      // set slave address
@@ -439,9 +484,58 @@ void store_data(byte addr, byte data)
 	}	
 }
 
-void test() 
+/*
+void write_disp(byte which_disps, byte which_row, byte data0, byte data1, byte data2)
 {
+	// order of column
+	static const byte row_xlat[8] = { 0, 1, 2, 3, 7, 6, 5, 4 };
 
+	// order of rows
+	static const byte col_mask[8] = { 1<<7, 1<<6, 1<<5, 1<<4, 1<<3, 1<<2, 1<<0, 1<<1 };
+
+	// for this address, we'll always be using the same bit
+	// in the anode shift register data for each column
+	byte write_mask = col_mask[which_row & 0x07]; // mod 8
+			
+	for(byte read_mask = 0x80; read_mask; read_mask>>=1)
+	{		
+		if(which_disps & ADDR_DISP0) 
+		{
+			if(data0 & read_mask)
+				disp_data0[which_row] |= write_mask;
+			else
+				disp_data0[which_row] &= ~write_mask;
+		}
+		if(which_disps & ADDR_DISP1) 
+		{
+			if(data1 & read_mask)
+				disp_data1[which_row] |= write_mask;
+			else
+				disp_data1[which_row] &= ~write_mask;
+		}
+		if(which_disps & ADDR_DISP2) 
+		{
+			if(data2 & read_mask)
+				disp_data2[which_row] |= write_mask;
+			else
+				disp_data2[which_row] &= ~write_mask;
+		}
+	}
+}
+*/
+void handle_cls_cmd()
+{
+	cls();	
+}
+void handle_write_cmd(MASTER_CMD *this_cmd)
+{
+	byte addr = this_cmd->data[0];
+
+	for(int i=0; (addr < 48) && (i<this_cmd->data_len - 1); ++i, ++addr)
+		store_data(addr, this_cmd->data[i]);
+}
+void handle_test_cmd()
+{
 	store_data(0, 0b00000000);
 	store_data(1, 0b00110001);
 	store_data(2, 0b00001010);
@@ -469,18 +563,6 @@ void test()
 	store_data(21, 0b01010000);
 	store_data(22, 0b01001110);
 	store_data(23, 0b00000000);
-
-}
-void testw() 
-{
-	store_data(0, 0b00000000);
-	store_data(1, 0b00011000);
-	store_data(2, 0b00100100);
-	store_data(3, 0b01000010);
-	store_data(4, 0b01111110);
-	store_data(5, 0b01000010);
-	store_data(6, 0b01000010);
-	store_data(7, 0b00000000);
 }
 
 ////////////////////////////////////////////////////////////
@@ -521,7 +603,7 @@ void main()
 	
 	disp_state = DISP_BEGIN;
 	cls();
-	test();
+	handle_test_cmd();
 	long last_keyscan = 0;
 
 	// The main loop
@@ -574,6 +656,30 @@ void main()
 					}
 				}
 			}
+		}
+		// check if we have any incoming commands to process
+		if(cmd_head != cmd_tail) 
+		{
+			// get a pointer to this command in the buffer
+			MASTER_CMD *read_cmd = cmd_buffer[cmd_tail];
+			
+			// process the command
+			switch(read_cmd->data[0]) 
+			{
+				case CMD_CLS:
+					handle_cls_cmd();
+					break;
+				case CMD_TEST:
+					handle_test_cmd();
+					break;
+				default:
+					handle_write_cmd(read_cmd);
+					break;
+			}	
+			
+			// remove the command from the buffer
+			if(++cmd_tail >= NUM_CMDS)
+				cmd_tail = 0;
 		}
 	}
 }

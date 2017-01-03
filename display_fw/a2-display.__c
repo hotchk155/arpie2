@@ -4,6 +4,8 @@ Active Config=Debug
 Active Directory=D:\GitHub\arpie2\display_fw\
 Target=PIC16LF1825
 Config=1
+Last Ext=h
 [Files]
-Count=1
+Count=2
 File0=a2-display.c
+File1=a2-display.h
